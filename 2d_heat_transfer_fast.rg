@@ -61,8 +61,10 @@ end
 task initialize_tiles(plate : region(ispace(int2d), float),
                       plate_len : float, plate_top : float,
                       plate_left : float, plate_right : float,
-                      plate_bottom : float)
-where reads writes(plate) do
+                      plate_bottom : float,
+                      timers : region(ispace(int1d), timestamp),
+                      block_size : int64)
+where reads writes(timers, plate) do
   for p in plate do
     if p.x >= (plate_len - 1) then
       plate[p] = plate_top
@@ -76,6 +78,8 @@ where reads writes(plate) do
     if p.y >= (plate_len - 1) then
       plate[p] = plate_right
     end
+    var t = c.legion_get_current_time_in_micros()
+    timers[p.y * block_size + p.x].init_stop += t
   end
 end
 
@@ -172,9 +176,9 @@ task top_task()
   __fence(__execution, __block)
 
   initialize_tiles(plate2, plate_len, plate_top, plate_left,
-                   plate_right, plate_bottom)
+                   plate_right, plate_bottom, times, block_len)
   initialize_tiles(plate1, plate_len, plate_top, plate_left,
-                   plate_right, plate_bottom)
+                   plate_right, plate_bottom, times, block_len)
 
   fm.println("Start computation.")
   for time = 0, max_iter_time do
@@ -185,7 +189,7 @@ task top_task()
         sweep(plate1, next_plate2_tiles[p], plate_len, gamma, p_times[p])
       end
     else
-     __demand(__index_launch)
+      __demand(__index_launch)
       for p in is_blocks do
         sweep(plate2, next_plate1_tiles[p], plate_len, gamma, p_times[p])
       end
