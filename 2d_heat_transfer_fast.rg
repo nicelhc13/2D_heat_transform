@@ -3,6 +3,10 @@ import "regent"
 local c = regentlib.c
 local fm = require("std/format")  
 
+local cmapper
+
+local print_result = false
+
 do
   local root_dir = arg[0]:match(".*/") or "./"
 
@@ -20,17 +24,17 @@ do
 
   local mapper_cc = root_dir .. "2d_heat_transfer_mapper.cc"
   -- Construct 
-  mapper_so = os.tmpname() .. ".so"
-  print("Mapper:", mapper_so)
-  print("arg 0: ", arg[0], " and root dir: ", root_dir)
-  print("include directories: ", include_dirs)
+  local mapper_so = os.tmpname() .. ".so"
+  -- print("Mapper:", mapper_so)
+  -- print("arg 0: ", arg[0], " and root dir: ", root_dir)
+  -- print("include directories: ", include_dirs)
 
   local cxx = os.getenv("CXX") or "c++"
   local cxx_flags = os.getenv("CXXFLAGS") or ""
+  -- Position independent code + shared library options.
   cxx_flags = cxx_flags .. " -O2 -Wall -Werror -fPIC -shared"
-
   local cmd = (cxx .. " " .. cxx_flags .. " " .. include_path .. " " ..
-                mapper_cc .. " -o " .. mapper_so)
+               mapper_cc .. " -o " .. mapper_so)
   if os.execute(cmd) ~= 0 then
     print("Error: failed to compile ".. mapper_cc)
     assert(false)
@@ -39,44 +43,14 @@ do
   cmapper = terralib.includec("2d_heat_transfer_mapper.h", include_dirs)
 end
 
-task make_read_plate_partition(plate : region(ispace(int2d), float),
-                          n : int64, block_len : int64)
-where reads(plate) do
-  var coloring = c.legion_domain_point_coloring_create()
-  var lo = int2d { x = 0, y = 0 }
-  var hi = int2d { x = block_len - 1, y = block_len - 1 }
-  var idx = int2d { x = 0, y = 0 }
-  var block_dim = 0
-  while true do
-    if hi.x > n or hi.y > n then
-      break
-    end
-    while true do
-      if hi.x > n or hi.y > n then
-        break
-      end
-      var rect = rect2d { lo = lo, hi = hi }
-      c.legion_domain_point_coloring_color_domain(coloring, idx, rect)
-      lo = int2d { x = lo.x, y = lo.y + 1}
-      hi = int2d { x = hi.x, y = hi.y + 1}
-      idx = int2d { x = idx.x, y = idx.y + 1}
-    end
-    lo = int2d { x = lo.x + 1, y = 0 }
-    hi = int2d { x = hi.x + 1, y = block_len - 1 }
-    idx = int2d { x = idx.x + 1, y = 0}
-    block_dim += 1
-  end
-  var is_block = ispace(int2d, {x = block_dim, y = block_dim })
-  var p = partition(aliased, plate, coloring, is_block)
-  c.legion_domain_point_coloring_destroy(coloring)
-  return p
-end
-
+-- Partition the plate into tiles of n x n.
+-- Each tile is disjointed.
 task make_write_plate_partition(plate : region(ispace(int2d), float), n : int64)
 where reads(plate) do
   return partition(equal, plate, ispace(int2d, {x = n, y = n}))
 end
 
+-- Set initial heat temparature on the plate.
 task initialize_tiles(plate : region(ispace(int2d), float),
                       plate_len : float, plate_top : float,
                       plate_left : float, plate_right : float,
@@ -98,6 +72,7 @@ where reads writes(plate) do
   end
 end
 
+-- Sweep the plate and perform stencil operation with heat transfer equation.
 task sweep(cp : region(ispace(int2d), float),
            np : region(ispace(int2d), float),
            plate_len : int64, gamma : float)
@@ -114,7 +89,7 @@ where reads(cp), reads writes(np) do
   end
 end
 
-task main()
+task top_task()
   var plate_len = 50
   var max_iter_time = 10
 
@@ -125,7 +100,7 @@ task main()
   var gamma = (alpha * delta_t) / (delta_x * delta_x)
 
   fm.println("Alpha {} Delta X {} Delta T {.3} Gamma {.3} ",
-      alpha, delta_x, delta_t, gamma)
+     alpha, delta_x, delta_t, gamma)
 
   var is_plate =
       ispace(int2d, {x = plate_len, y = plate_len})
@@ -142,11 +117,8 @@ task main()
   if plate_len % block_len > 1 then
     num_blocks += 1
   end
-  fm.println("Blocks {}", num_blocks)
+  -- fm.println("Blocks {}", num_blocks)
   var is_blocks = ispace(int2d, { num_blocks, num_blocks })
-
-  var plate1_tiles = make_read_plate_partition(plate1, plate_len, block_len)
-  var plate2_tiles = make_read_plate_partition(plate2, plate_len, block_len)
 
   var next_plate1_tiles = make_write_plate_partition(plate1, num_blocks) 
   var next_plate2_tiles = make_write_plate_partition(plate2, num_blocks)
@@ -163,32 +135,37 @@ task main()
 
   fm.println("Start computation.")
   for time = 0, max_iter_time do
-    fm.println("Time: {}", time)
+    fm.println("Time step : {}", time)
     if time % 2 == 0 then
       __demand(__index_launch)
       for p in is_blocks do
         sweep(plate1, next_plate2_tiles[p], plate_len, gamma)
       end
     else
-      __demand(__index_launch)
+     __demand(__index_launch)
       for p in is_blocks do
         sweep(plate2, next_plate1_tiles[p], plate_len, gamma)
       end
     end
-  end
-  fm.println("Computation completes.")
+   end
+   fm.println("Computation completes.")
 
---  for b in ispace(int2d, { x = num_blocks, y = num_blocks }) do
---    if max_iter_time % 2 == 0 then
---      for i in next_plate1_tiles[b] do
---        fm.println("[{} {}] {} ", i.x, i.y, next_plate1_tiles[b][i])
---      end
---    else
---      for i in next_plate2_tiles[b] do
---        fm.println("[{} {}] {} ", i.x, i.y, next_plate2_tiles[b][i])
---      end
---    end
---  end
+   if print_result then
+     for b in ispace(int2d, { x = num_blocks, y = num_blocks }) do
+       if max_iter_time % 2 == 0 then
+         for i in next_plate1_tiles[b] do
+           fm.println("[{} {}] {} ", i.x, i.y, next_plate1_tiles[b][i])
+         end
+       else
+         for i in next_plate2_tiles[b] do
+           fm.println("[{} {}] {} ", i.x, i.y, next_plate2_tiles[b][i])
+         end
+       end
+     end
+   end
 end
+extern task main()
+main:set_task_id(0)
 
-regentlib.start(main, cmapper.register_mappers)
+print("Register mapper..");
+regentlib.start(top_task, cmapper.register_mappers)
