@@ -59,6 +59,8 @@ Processor HeatTransferMapper::default_policy_select_initial_processor(
                                     MapperContext ctx, const Task &task)
 {
   std::cout << "[HeatTransferMapper] Default policy select initial processor \n";
+
+
   // Select the initial processor. First, it finds a compatible variant
   // and second, it returns the next processor to scheduled the task
   // in a round-robin manner to give load balancing.
@@ -192,6 +194,7 @@ void map_random_requirement(MapperContext ctx,
 
 void HeatTransferMapper::map_task(const MapperContext ctx, const Task& task,
                            const MapTaskInput& input, MapTaskOutput& output) {
+  printf("Map task %d and name %s\n", task.task_id, task.get_task_name());
 #if 0
   const std::map<VariantID,Processor::Kind> &variant_kinds =
     find_task_variants(ctx, task.task_id);
@@ -257,6 +260,7 @@ void HeatTransferMapper::map_task(const MapperContext ctx, const Task& task,
     output.task_prof_requests.add_measurement<RuntimeOverhead>();
   }
 #endif
+  std::cout << "Task id:" << task.arglen << "\n";
   DefaultMapper::map_task(ctx, task, input, output);
 }
 
@@ -268,7 +272,7 @@ static void create_mappers(Machine machine, Runtime *runtime,
 
   // Construct a processor list for a mapper.
   Machine::ProcessorQuery procs_query(machine);
-  procs_query.only_kind(Processor::LOC_PROC);
+  procs_query.only_kind(Processor::TOC_PROC);
   for (Machine::ProcessorQuery::iterator it = procs_query.begin();
        it != procs_query.end(); ++it) {
     // Each iterator points to a Processor object.

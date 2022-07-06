@@ -219,5 +219,5 @@ extern task main()
 main:set_task_id(0)
 
 print("Register mapper..");
--- regentlib.start(top_task, cmapper.register_mappers)
-regentlib.start(top_task)
+regentlib.start(top_task, cmapper.register_mappers)
+-- regentlib.start(top_task)

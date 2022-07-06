@@ -265,4 +265,6 @@ task main()
 
 end
 
+main:set_task_id(2)
+
 regentlib.start(main)
