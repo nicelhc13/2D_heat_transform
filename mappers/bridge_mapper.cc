@@ -22,6 +22,14 @@ public:
                                     const MapTaskInput& input,
                                     MapTaskOutput& output);
 
+
+  Processor get_fixed_target_proc(const Task& task);
+  Memory get_fixed_target_mem(const MapperContext ctx, Processor target_proc,
+                              const Task& task, MemoryConstraint mc,
+                              uint32_t ri);
+
+  void set_mapping_from(const MapperContext ctx, const Task& task,
+                        const MapTaskInput& input, MapTaskOutput& output);
 protected:
   struct Mapping {
   public:
@@ -103,7 +111,8 @@ void BridgeMapper::map_task(const MapperContext ctx, const Task& task,
     DefaultMapper::map_task(ctx, task, input, output);
   } else {
     std::cout << "Sampled mapping is used.\n" << std::flush;
-    generate_mapping_using_coord(ctx, task, input, output);
+    //generate_mapping_using_coord(ctx, task, input, output);
+    set_mapping_from(ctx, task, input, output);
   }
 
   num_iter_ += 1;
@@ -183,6 +192,10 @@ void BridgeMapper::generate_mapping_using_coord(const MapperContext ctx,
   //----------------------------------------------------------------------------
 
   std::vector<std::set<FieldID>> target_fields(task.regions.size());
+  // Remove elements from chosen instances if any conflict exists between
+  // the layout contraint.
+  // The target_fields will be filled with privileged fields that
+  // do not exist on the instance yet; so need to be created.
   runtime->filter_instances(ctx, task, output.chosen_variant,
                             output.chosen_instances, target_fields);
   // Get task constraints (These are user-specified constraints at application.
@@ -297,8 +310,112 @@ void BridgeMapper::generate_mapping_using_coord(const MapperContext ctx,
     }
     output.chosen_instances[ri] = input.valid_instances[ri];
     runtime->acquire_and_filter_instances(ctx, output.chosen_instances);
-  }
 #endif
+}
+
+Processor BridgeMapper::get_fixed_target_proc(const Task& task) {
+  uint32_t target_gpu_id = calc_gpu_id(task.index_point, task.index_domain); 
+  return GPU_procs_[target_gpu_id];
+}
+
+Memory BridgeMapper::get_fixed_target_mem(const MapperContext ctx,
+                                          Processor target_proc,
+                                          const Task& task, MemoryConstraint mc,
+                                          uint32_t ri) {
+  return DefaultMapper::default_policy_select_target_memory(ctx, target_proc,
+                                                            task.regions[ri],
+                                                            mc);
+}
+
+void BridgeMapper::set_mapping_from(const MapperContext ctx, const Task& task,
+                                    const MapTaskInput& input,
+                                    MapTaskOutput& output) {
+  //----------------------------------------------------------------------------
+  // Choose default option.
+  //----------------------------------------------------------------------------
+
+  Processor target_proc = get_fixed_target_proc(task);
+  // Ignore existing target processors and always use the specified processor.
+  output.target_procs.clear();
+  output.target_procs.push_back(target_proc);
+  output.chosen_variant = default_find_preferred_variant(task, ctx,
+      true, true, target_proc.kind()).variant;
+  output.task_priority = 0;
+  output.postmap_task = false;
+
+  // TODO(hc): disable the mapping cache feature to use the specified mapping.
+  // (The current caching considers any visible memory instance as a candidate)
+
+  //----------------------------------------------------------------------------
+  // Find or create physical region instances 
+  //----------------------------------------------------------------------------
+
+  std::vector<std::set<FieldID>> target_fields(task.regions.size());
+  // Remove elements from chosen instances if any conflict exists between
+  // the layout contraint.
+  // The target_fields will be filled with privileged fields that
+  // do not exist on the instance yet; so need to be created.
+  runtime->filter_instances(ctx, task, output.chosen_variant,
+                            output.chosen_instances, target_fields);
+  // Get task constraints (These are user-specified constraints at application.
+  // These are different from layout constraitns.).
+  const TaskLayoutConstraintSet &layout_constraints =
+    runtime->find_task_layout_constraints(ctx, task.task_id,
+                                          output.chosen_variant);
+
+  // Allocate regions onto the target processors.
+  for (uint32_t ri = 0; ri < task.regions.size(); ++ri) {
+    const RegionRequirement& rreq = task.regions[ri];
+    // Skip empty regions. It requires nothing.
+    if ((rreq.privilege == LEGION_NO_ACCESS) ||
+        (rreq.privilege_fields.empty()) || target_fields[ri].empty()) {
+      continue;
+    }
+
+    // Get the first valid constraint for the region[ri].
+    // A returned constraint could be invalid, and in this case, return
+    // the existing any cached memory, or create new memory as the normal
+    // execution path does.
+    MemoryConstraint memory_constraint =
+      DefaultMapper::find_memory_constraint(ctx, task, output.chosen_variant,
+                                            ri);
+    // Get the specified memory instace. Note that the current implementation
+    // uses the default policy. This should be the specified memory
+    // by the RL module.
+    Memory target_memory = get_fixed_target_mem(ctx, target_proc, task,
+                                                memory_constraint, ri);
+
+    // Get valid instances that the runtime already knows.
+    std::vector<PhysicalInstance> valid_instances;
+    for (std::vector<PhysicalInstance>::const_iterator
+         it = input.valid_instances[ri].begin(),
+         ie = input.valid_instances[ri].end(); it != ie; ++it) {
+      if (it->get_location() == target_memory) {
+        valid_instances.push_back(*it);
+      }
+    }
+    std::set<FieldID> valid_target_fields;
+    runtime->filter_instances(ctx, task, ri, output.chosen_variant,
+                              valid_instances, valid_target_fields);
+    // Detach fields from the target region physical instances.
+    // Only detach the regions that were not acquire by other tasks.
+    // TODO(hc): slighlty confused yet.
+    runtime->acquire_and_filter_instances(ctx, valid_instances);
+    output.chosen_instances[ri] = valid_instances;
+    target_fields[ri] = valid_target_fields;
+
+    if (valid_target_fields.empty()) { continue; }
+
+    // Create the new instance with necessary fields and their previleges.
+    size_t footprint;
+    if (!DefaultMapper::default_create_custom_instances(ctx, target_proc,
+            target_memory, task.regions[ri], ri, target_fields[ri],
+            layout_constraints, false,
+            output.chosen_instances[ri], &footprint)) {
+      DefaultMapper::default_report_failed_instance_creation(task, ri,
+          target_proc, target_memory, footprint);
+    }
+  }
 }
 
 static void create_mappers(Machine machine, Runtime *runtime,
