@@ -22,7 +22,7 @@ do
     include_dirs:insert(path)
   end
 
-  local mapper_cc = root_dir .. "2d_heat_transfer_mapper.cc"
+  local mapper_cc = root_dir .. "/mappers/bridge_mapper.cc"
   -- Construct 
   local mapper_so = os.tmpname() .. ".so"
   -- print("Mapper:", mapper_so)
@@ -40,7 +40,7 @@ do
     assert(false)
   end
   regentlib.linklibrary(mapper_so)
-  cmapper = terralib.includec("2d_heat_transfer_mapper.h", include_dirs)
+  cmapper = terralib.includec("mappers/bridge_mapper.h", include_dirs)
 end
 
 fspace timestamp {
@@ -84,6 +84,7 @@ where reads writes(timers, plate) do
 end
 
 -- Sweep the plate and perform stencil operation with heat transfer equation.
+__demand(__cuda)
 task sweep(cp : region(ispace(int2d), float),
            np : region(ispace(int2d), float),
            plate_len : int64, gamma : float,
@@ -97,9 +98,9 @@ where reads(cp), reads writes(np, timers) do
       var is_i3 = int2d { x = n.x, y = n.y - 1 }
       np[n] = gamma * (cp[is_i0] + cp[is_i1] + cp[is_i2] +
                   cp[is_i3] - 4 * cp[n]) + cp[n]
-      var t = c.legion_get_current_time_in_micros()
-      timers[int1d {0}].comp_stop = t
     end
+    -- var t = c.legion_get_current_time_in_micros()
+    -- timers[int1d {0}].comp_stop = t
   end
 end
 
@@ -180,6 +181,8 @@ task top_task()
   initialize_tiles(plate1, plate_len, plate_top, plate_left,
                    plate_right, plate_bottom, times, block_len)
 
+  -- New timer (TODO(hc): existing timers should be removed)
+  var ts_start = regentlib.c.legion_get_current_time_in_micros()
   fm.println("Start computation.")
   for time = 0, max_iter_time do
     fm.println("Time step : {}", time)
@@ -200,23 +203,25 @@ task top_task()
    var { init_time, comp_time } = get_elapsed(times)
    fm.println("Init Time = {7.3} s", init_time)
    fm.println("Compute Time = {7.3} s", comp_time)
+   var ts_end = regentlib.c.legion_get_current_time_in_micros()
+   fm.println("wall-clock time: {} us\n", ts_end - ts_start)
 
-   if print_result then
-     for b in ispace(int2d, { x = num_blocks, y = num_blocks }) do
-       if max_iter_time % 2 == 0 then
-         for i in next_plate1_tiles[b] do
-           fm.println("[{} {}] {} ", i.x, i.y, next_plate1_tiles[b][i])
-         end
-       else
-         for i in next_plate2_tiles[b] do
-           fm.println("[{} {}] {} ", i.x, i.y, next_plate2_tiles[b][i])
-         end
-       end
-     end
-   end
+
+--  if print_result then
+--    for b in ispace(int2d, { x = num_blocks, y = num_blocks }) do
+--      if max_iter_time % 2 == 0 then
+--        for i in next_plate1_tiles[b] do
+--          fm.println("[{} {}] {} ", i.x, i.y, next_plate1_tiles[b][i])
+--        end
+--      else
+--        for i in next_plate2_tiles[b] do
+--          fm.println("[{} {}] {} ", i.x, i.y, next_plate2_tiles[b][i])
+--        end
+--      end
+--    end
+--  end
 end
 extern task main()
-main:set_task_id(0)
 
 print("Register mapper..");
 regentlib.start(top_task, cmapper.register_mappers)
