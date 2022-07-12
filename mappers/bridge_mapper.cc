@@ -1,6 +1,9 @@
-#include "bridge_mapper.h"
-
+#include "heat_transfer/mappers/bridge_mapper.h"
+#include "heat_transfer/profiling/profiling_constants.h"
 #include "mappers/default_mapper.h"
+
+#include "legion.h"
+#include "legion/legion_mapping.h"
 
 using namespace Legion;
 using namespace Legion::Mapping;
@@ -11,11 +14,21 @@ public:
   BridgeMapper(MapperRuntime* rt, Machine machine, Processor local_proc,
                const char* mapper_name, std::vector<Processor>* procs_list);
 
+  // ---------------------------------------------------------------------------
+  // Function overrides.
+  // ---------------------------------------------------------------------------
   virtual void select_task_options(const MapperContext ctx,
                                    const Task& task, TaskOptions& output);
 
   virtual void map_task(const MapperContext ctx, const Task& task,
                         const MapTaskInput& input, MapTaskOutput& output);
+
+  virtual void report_profiling(const MapperContext ctx, const Task& task,
+                                const TaskProfilingInfo& input);
+
+  virtual void select_tunable_value(const MapperContext ctx, const Task& task,
+                                    const SelectTunableInput& input,
+                                    SelectTunableOutput& output);
 
   void generate_mapping_using_coord(const MapperContext ctx,
                                     const Task& task,
@@ -30,6 +43,10 @@ public:
 
   void set_mapping_from(const MapperContext ctx, const Task& task,
                         const MapTaskInput& input, MapTaskOutput& output);
+
+  bool is_start_timer_task(const Task& t);
+  bool is_end_timer_task(const Task& t);
+  bool is_timer_task(const Task& t);
 protected:
   struct Mapping {
   public:
@@ -43,6 +60,8 @@ protected:
 
 private:
   size_t num_iter_;
+  // CPU processor for auxiliary tasks
+  Processor default_cpu_processor_;
   // Task ID to mapping.
   std::map<TaskID, Mapping> sampled_mapping_;
   // Cached mapping.
@@ -51,18 +70,38 @@ private:
   // GPU processors.
   // Logical index will be used. TODO(hc): is it corresponding to CUDA number?
   std::vector<Processor> GPU_procs_;
+  // Task set for timers.
+  std::set<std::string> tasks_start_timer_;
+  std::set<std::string> tasks_end_timer_;
+  // Timers.
+  uint64_t start_time_;
+  std::vector<double> end_times_;
+
+  MapperEvent defer_mapping_start_;
+  MapperEvent defer_mapping_stop_;
 };
 
 BridgeMapper::BridgeMapper(MapperRuntime* rt, Machine machine,
                            Processor local_proc, const char* mapper_name,
                            std::vector<Processor>* procs_list)
-  : DefaultMapper(rt, machine, local_proc, mapper_name), num_iter_(0) {
+  : DefaultMapper(rt, machine, local_proc, mapper_name),
+  num_iter_(0), default_cpu_processor_(Processor::NO_PROC) {
   std::set<Processor> all_procs;
   machine.get_all_processors(all_procs);
+
+  tasks_start_timer_.insert("start_timer");
+  tasks_end_timer_.insert("end_timer");
   
   for (std::set<Processor>::const_iterator it = all_procs.begin();
        it != all_procs.end(); ++it) {
     switch(it->kind()) {
+      case Processor::LOC_PROC:
+        {
+          if (default_cpu_processor_ != Processor::NO_PROC) {
+            default_cpu_processor_ = *it;
+          }
+          break;
+        }
       case Processor::TOC_PROC:
         {
           printf(" GPU processor ID " IDFMT " \n", it->id);
@@ -72,8 +111,20 @@ BridgeMapper::BridgeMapper(MapperRuntime* rt, Machine machine,
       default:
         break;
     }
-  }
-  
+  }  
+}
+
+
+bool BridgeMapper::is_start_timer_task(const Task& t) {
+  return tasks_start_timer_.find(t.get_task_name()) != tasks_start_timer_.end();
+}
+
+bool BridgeMapper::is_end_timer_task(const Task& t) {
+  return tasks_end_timer_.find(t.get_task_name()) != tasks_end_timer_.end();
+}
+
+bool BridgeMapper::is_timer_task(const Task& t) {
+  return is_start_timer_task(t) || is_end_timer_task(t);
 }
 
 void BridgeMapper::select_task_options(const MapperContext ctx,
@@ -84,6 +135,12 @@ void BridgeMapper::select_task_options(const MapperContext ctx,
   // Eanble the runtime to track, and get valid instances and get premapped
   // region information.
   output.valid_instances = true;
+
+  // Necessary to map timer tasks on the same CPU for correctness.
+  if (is_timer_task(task)) {
+    output.stealable = false;
+    output.initial_proc = default_cpu_processor_;
+  }
 }
 
 static uint32_t calc_gpu_id(DomainPoint dp, Domain dm) {
@@ -99,6 +156,33 @@ static uint32_t calc_gpu_id(DomainPoint dp, Domain dm) {
   return gpu_id;
 }
 
+void BridgeMapper::report_profiling(const MapperContext ctx, const Task& task,
+                                    const TaskProfilingInfo& input) {
+  using namespace ProfilingMeasurements;
+  OperationTimeline *tl =
+      input.profiling_responses.get_measurement<OperationTimeline>();
+  int64_t started{-1}, ended{-1};
+  if (tl) {
+    started = tl->start_time;
+    ended = tl->complete_time;
+    delete tl;
+  } else {
+  std::cout << "No operation timeline for task " << task.get_task_name() << "\n"
+      << std::flush;
+    assert(false);
+  }
+
+  if (is_start_timer_task(task)) {
+    start_time_ = ended;
+  } else if (is_end_timer_task(task)) {
+    end_times_.emplace_back((double)(started - start_time_) / 1000000.0);
+    std::cout << " [Iteration:" << num_iter_ << "] Time " << end_times_.back()
+      << "ms \n" << std::flush;
+  }
+
+  num_iter_ += 1;
+}
+
 void BridgeMapper::map_task(const MapperContext ctx, const Task& task,
                             const MapTaskInput& input, MapTaskOutput& output) {
   std::cout << "Task mapping: " << task.get_task_name() << ", # of regions:" << task.regions.size() << "\n" << std::flush;
@@ -109,13 +193,18 @@ void BridgeMapper::map_task(const MapperContext ctx, const Task& task,
     std::cout << "Default mapper is used.\n" << std::flush;
     // The first iteration uses the default mapper.
     DefaultMapper::map_task(ctx, task, input, output);
+  } else if (is_timer_task(task)) {
+    using namespace ProfilingMeasurements;
+    output.task_prof_requests.add_measurement<OperationStatus>();
+    output.task_prof_requests.add_measurement<OperationTimeline>();
+    output.profiling_priority = 1;
+    DefaultMapper::map_task(ctx, task, input, output);
   } else {
     std::cout << "Sampled mapping is used.\n" << std::flush;
     //generate_mapping_using_coord(ctx, task, input, output);
     set_mapping_from(ctx, task, input, output);
   }
 
-  num_iter_ += 1;
   std::cout << " Target proc:" << output.target_procs[0].kind() << "\n" << std::flush;
 }
 
@@ -311,6 +400,44 @@ void BridgeMapper::generate_mapping_using_coord(const MapperContext ctx,
     output.chosen_instances[ri] = input.valid_instances[ri];
     runtime->acquire_and_filter_instances(ctx, output.chosen_instances);
 #endif
+}
+
+void BridgeMapper::select_tunable_value(const MapperContext ctx,
+                                        const Task& task,
+                                        const SelectTunableInput& input,
+                                        SelectTunableOutput& output) {
+  switch (input.tunable_id) {
+    case TUNABLE_VALUE_START: {
+      size_t* result = (size_t*) malloc(sizeof(size_t));
+      output.value = result;
+      output.size = sizeof(size_t);
+      runtime->disable_reentrant(ctx);
+      if (!defer_mapping_start_.exists()) {
+        defer_mapping_start_ = runtime->create_mapper_event(ctx);
+      }
+      runtime->enable_reentrant(ctx);
+      runtime->wait_on_mapper_event(ctx, defer_mapping_start_);
+      defer_mapping_start_ = MapperEvent();
+      *result = TUNABLE_VALUE_START;
+      break;
+    }
+    case TUNABLE_VALUE_STOP: {
+      size_t* result = (size_t*) malloc(sizeof(size_t));
+      output.value = result;
+      output.size = sizeof(size_t);
+      runtime->disable_reentrant(ctx);
+      if (!defer_mapping_stop_.exists()) {
+        defer_mapping_stop_ = runtime->create_mapper_event(ctx);
+      }
+      runtime->enable_reentrant(ctx);
+      runtime->wait_on_mapper_event(ctx, defer_mapping_stop_);
+      defer_mapping_stop_ = MapperEvent();
+      *result = TUNABLE_VALUE_STOP;
+      break;
+    }
+    default: {
+    }
+  }
 }
 
 Processor BridgeMapper::get_fixed_target_proc(const Task& task) {

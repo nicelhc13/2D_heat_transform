@@ -1,7 +1,10 @@
 import "regent"
 
+terralib.includepath = terralib.includepath .. ";" .. "profiling/;./"
+
 local c = regentlib.c
 local fm = require("std/format")  
+local BRIDGEMAP = require("profiling/profiling_wrapper")
 
 local cmapper
 
