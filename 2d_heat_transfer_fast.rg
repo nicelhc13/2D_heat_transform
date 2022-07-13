@@ -175,7 +175,9 @@ task top_task()
   begin_init_timer(times)
   __fence(__execution, __block)
 
-  -- TODO(hc): should mimick automap.
+  -- Repeat until it finds the best mapping.
+  -- TODO(hc): for now, repeat 10 times. It should need
+  -- a convergence condition like automap.
   for epoch = 0, 10 do
     -- Initialize regions first.
     fill (plate1, 0)
