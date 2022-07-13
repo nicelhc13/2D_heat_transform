@@ -30,6 +30,9 @@ public:
                                     const SelectTunableInput& input,
                                     SelectTunableOutput& output);
 
+  virtual void handle_message(const MapperContext ctx,
+                              const MapperMessage &msg);
+
   void generate_mapping_using_coord(const MapperContext ctx,
                                     const Task& task,
                                     const MapTaskInput& input,
@@ -90,15 +93,16 @@ BridgeMapper::BridgeMapper(MapperRuntime* rt, Machine machine,
   machine.get_all_processors(all_procs);
 
   tasks_start_timer_.insert("start_timer");
-  tasks_end_timer_.insert("end_timer");
+  tasks_end_timer_.insert("stop_timer");
   
   for (std::set<Processor>::const_iterator it = all_procs.begin();
        it != all_procs.end(); ++it) {
     switch(it->kind()) {
       case Processor::LOC_PROC:
         {
-          if (default_cpu_processor_ != Processor::NO_PROC) {
+          if (default_cpu_processor_ == Processor::NO_PROC) {
             default_cpu_processor_ = *it;
+            printf(" CPU processor ID " IDFMT " \n", it->id);
           }
           break;
         }
@@ -135,6 +139,9 @@ void BridgeMapper::select_task_options(const MapperContext ctx,
   // Eanble the runtime to track, and get valid instances and get premapped
   // region information.
   output.valid_instances = true;
+  output.stealable = true;
+  output.inline_task = false;
+  output.map_locally = false;
 
   // Necessary to map timer tasks on the same CPU for correctness.
   if (is_timer_task(task)) {
@@ -156,8 +163,14 @@ static uint32_t calc_gpu_id(DomainPoint dp, Domain dm) {
   return gpu_id;
 }
 
+void BridgeMapper::handle_message(const MapperContext ctx,
+                                  const MapperMessage &msg) {
+  std::cout << "handle msg()\n" << std::flush;
+}
+
 void BridgeMapper::report_profiling(const MapperContext ctx, const Task& task,
                                     const TaskProfilingInfo& input) {
+  std::cout << "report profiling\n" << std::flush;
   using namespace ProfilingMeasurements;
   OperationTimeline *tl =
       input.profiling_responses.get_measurement<OperationTimeline>();
@@ -173,11 +186,16 @@ void BridgeMapper::report_profiling(const MapperContext ctx, const Task& task,
   }
 
   if (is_start_timer_task(task)) {
+    std::cout << "start timer report profiling\n" << std::flush;
     start_time_ = ended;
+    std::cout << "start timer event is triggered\n" << std::flush;
+    runtime->trigger_mapper_event(ctx, defer_mapping_start_);
   } else if (is_end_timer_task(task)) {
     end_times_.emplace_back((double)(started - start_time_) / 1000000.0);
     std::cout << " [Iteration:" << num_iter_ << "] Time " << end_times_.back()
       << "ms \n" << std::flush;
+    std::cout << "stop timer event is triggered\n" << std::flush;
+    runtime->trigger_mapper_event(ctx, defer_mapping_stop_);
   }
 
   num_iter_ += 1;
@@ -189,18 +207,22 @@ void BridgeMapper::map_task(const MapperContext ctx, const Task& task,
   std::cout << ", task domain point:" << task.index_point << ", target proc:" << task.target_proc << "\n" << std::flush;
   //DefaultMapper::map_task(ctx, task, input, output);
 
-  if (num_iter_ == 0 || strstr(task.get_task_name(), "sweep") == NULL) {
-    std::cout << "Default mapper is used.\n" << std::flush;
+  if (!is_timer_task(task) && strstr(task.get_task_name(), "sweep") == NULL) {
+    std::cout << "Default mapper is used. (task name:" << task.get_task_name()
+      << ") \n" << std::flush;
     // The first iteration uses the default mapper.
     DefaultMapper::map_task(ctx, task, input, output);
   } else if (is_timer_task(task)) {
+    std::cout << "Timer tasks are mapped. (task name:" << task.get_task_name()
+      << ") \n" << std::flush;
     using namespace ProfilingMeasurements;
     output.task_prof_requests.add_measurement<OperationStatus>();
     output.task_prof_requests.add_measurement<OperationTimeline>();
     output.profiling_priority = 1;
     DefaultMapper::map_task(ctx, task, input, output);
   } else {
-    std::cout << "Sampled mapping is used.\n" << std::flush;
+    std::cout << "Sampled mapping is used. (task name:" << task.get_task_name()
+      << ") \n" << std::flush;
     //generate_mapping_using_coord(ctx, task, input, output);
     set_mapping_from(ctx, task, input, output);
   }
@@ -402,6 +424,14 @@ void BridgeMapper::generate_mapping_using_coord(const MapperContext ctx,
 #endif
 }
 
+/// This function is used to block the execution by using a customized
+/// event. For example, the actual processing for start/stop timer tasks
+/// are on the mapper layer. The only objective of the application level
+/// tasks is to fence the execution and invoke the corresponding information
+/// TODO(hc): need to write this down.
+/// collection task declared at the mapper.
+/// register events, and blocks
+/// the execution until 
 void BridgeMapper::select_tunable_value(const MapperContext ctx,
                                         const Task& task,
                                         const SelectTunableInput& input,
@@ -413,10 +443,13 @@ void BridgeMapper::select_tunable_value(const MapperContext ctx,
       output.size = sizeof(size_t);
       runtime->disable_reentrant(ctx);
       if (!defer_mapping_start_.exists()) {
+        printf("Creating new start event\n");
         defer_mapping_start_ = runtime->create_mapper_event(ctx);
       }
       runtime->enable_reentrant(ctx);
+      std::cout << "Wait on start timer\n" << std::flush;
       runtime->wait_on_mapper_event(ctx, defer_mapping_start_);
+      std::cout << "Wait on start timer [done] \n" << std::flush;
       defer_mapping_start_ = MapperEvent();
       *result = TUNABLE_VALUE_START;
       break;
@@ -427,10 +460,13 @@ void BridgeMapper::select_tunable_value(const MapperContext ctx,
       output.size = sizeof(size_t);
       runtime->disable_reentrant(ctx);
       if (!defer_mapping_stop_.exists()) {
+        printf("Creating new stop event\n");
         defer_mapping_stop_ = runtime->create_mapper_event(ctx);
       }
       runtime->enable_reentrant(ctx);
+      std::cout << "Wait on stop timer\n" << std::flush;
       runtime->wait_on_mapper_event(ctx, defer_mapping_stop_);
+      std::cout << "Wait on stop timer [done] \n" << std::flush;
       defer_mapping_stop_ = MapperEvent();
       *result = TUNABLE_VALUE_STOP;
       break;

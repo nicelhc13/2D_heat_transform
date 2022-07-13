@@ -149,10 +149,6 @@ task top_task()
   var plate1 = region(is_plate, float)
   var plate2 = region(is_plate, float)
 
-  -- Initialize regions first.
-  fill (plate1, 0)
-  fill (plate2, 0)
-
   -- TODO(lhc): use configuration option.
   var block_len = 3
   var num_blocks = plate_len / block_len
@@ -179,36 +175,45 @@ task top_task()
   begin_init_timer(times)
   __fence(__execution, __block)
 
-  initialize_tiles(plate2, plate_len, plate_top, plate_left,
-                   plate_right, plate_bottom, times, block_len)
-  initialize_tiles(plate1, plate_len, plate_top, plate_left,
-                   plate_right, plate_bottom, times, block_len)
+  -- TODO(hc): should mimick automap.
+  for epoch = 0, 10 do
+    -- Initialize regions first.
+    fill (plate1, 0)
+    fill (plate2, 0)
+    initialize_tiles(plate2, plate_len, plate_top, plate_left,
+                     plate_right, plate_bottom, times, block_len)
+    initialize_tiles(plate1, plate_len, plate_top, plate_left,
+                     plate_right, plate_bottom, times, block_len)
 
-  -- New timer (TODO(hc): existing timers should be removed)
-  var ts_start = regentlib.c.legion_get_current_time_in_micros()
-  fm.println("Start computation.")
-  for time = 0, max_iter_time do
-    fm.println("Time step : {}", time)
-    if time % 2 == 0 then
-      __demand(__index_launch)
-      for p in is_blocks do
-        sweep(plate1, next_plate2_tiles[p], plate_len, gamma, p_times[p])
-      end
-    else
-      __demand(__index_launch)
-      for p in is_blocks do
-        sweep(plate2, next_plate1_tiles[p], plate_len, gamma, p_times[p])
+    -- Start profiling.
+    BRIDGEMAP.begin_profile()
+    -- New timer (TODO(hc): existing timers should be removed)
+    var ts_start = regentlib.c.legion_get_current_time_in_micros()
+    fm.println("Start computation.")
+    for time = 0, max_iter_time do
+      fm.println("Time step : {}", time)
+      if time % 2 == 0 then
+        __demand(__index_launch)
+        for p in is_blocks do
+          sweep(plate1, next_plate2_tiles[p], plate_len, gamma, p_times[p])
+        end
+      else
+        __demand(__index_launch)
+        for p in is_blocks do
+          sweep(plate2, next_plate1_tiles[p], plate_len, gamma, p_times[p])
+        end
       end
     end
-   end
-   fm.println("Computation completes.")
+    -- End profiling.
+    BRIDGEMAP.end_profile()
+    fm.println("Computation completes.")
 
-   var { init_time, comp_time } = get_elapsed(times)
-   fm.println("Init Time = {7.3} s", init_time)
-   fm.println("Compute Time = {7.3} s", comp_time)
-   var ts_end = regentlib.c.legion_get_current_time_in_micros()
-   fm.println("wall-clock time: {} us\n", ts_end - ts_start)
-
+    var { init_time, comp_time } = get_elapsed(times)
+    fm.println("Init Time = {7.3} s", init_time)
+    fm.println("Compute Time = {7.3} s", comp_time)
+    var ts_end = regentlib.c.legion_get_current_time_in_micros()
+    fm.println("wall-clock time: {} us\n", ts_end - ts_start)
+  end
 
 --  if print_result then
 --    for b in ispace(int2d, { x = num_blocks, y = num_blocks }) do
