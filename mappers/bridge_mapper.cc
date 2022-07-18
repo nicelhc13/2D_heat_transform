@@ -560,6 +560,7 @@ Memory BridgeMapper::get_fixed_target_mem(const MapperContext ctx,
 void BridgeMapper::set_mapping_from(const MapperContext ctx, const Task& task,
                                     const MapTaskInput& input,
                                     MapTaskOutput& output) {
+  std::cout << "Set mapping from..\n" << std::flush;
   //----------------------------------------------------------------------------
   // Choose default option.
   //----------------------------------------------------------------------------
@@ -593,6 +594,63 @@ void BridgeMapper::set_mapping_from(const MapperContext ctx, const Task& task,
     runtime->find_task_layout_constraints(ctx, task.task_id,
                                           output.chosen_variant);
 
+  // --- Test code getting the number of existing physical instances -----------
+
+  // First, get the number of existing physical instances as a test.
+  for (uint32_t ri = 0; ri < task.regions.size(); ++ri) {
+    const TaskLayoutConstraintSet &task_layout_constraints =
+      runtime->find_task_layout_constraints(ctx,
+                            task.task_id, output.chosen_variant);
+    // Iterate layout constraints specified to a task.
+    // Different layouts having different constraints create different
+    // instances.
+    for (std::multimap<unsigned, LayoutConstraintID>::const_iterator
+           lay_const_it = task_layout_constraints.layouts.lower_bound(ri);
+           lay_const_it != task_layout_constraints.layouts.upper_bound(ri);
+           ++lay_const_it) {
+      // Find a set of constraints for a index space.
+      const LayoutConstraintSet& index_constraints =
+        runtime->find_layout_constraints(ctx, lay_const_it->second);
+
+      // Iterate all visible memory from the chosen processor (by action
+      // chosen by RL) and check if it materializes a region.
+      uint64_t num_existing_regions{0};
+      Machine::MemoryQuery visible_memories(machine);
+      for (Machine::MemoryQuery::iterator visible_mem_it =
+            visible_memories.begin();
+            visible_mem_it != visible_memories.end(); ++visible_mem_it) {
+        Memory target_memory = *visible_mem_it;
+        // Return the root logical region of the target region.
+        LogicalRegion target_region =
+          DefaultMapper::default_policy_select_instance_region(ctx, target_memory,
+              task.regions[ri], index_constraints, false /* force new instance */,
+              true);
+        std::vector<LogicalRegion> target_regions(1, target_region);
+
+        // First, compare memory constraints and region constraints.
+        const MemoryConstraint& mem_constriant =
+          runtime->find_layout_constraints(ctx, lay_const_it->second).
+                   memory_constraint;
+        if (mem_constriant.is_valid() &&
+            mem_constriant.get_kind() != visible_mem_it->kind()) { continue; }
+        PhysicalInstance target_instance;
+        bool tight_region_bounds =
+          index_constraints.specialized_constraint.is_exact() ||
+          ((task.regions[ri].tag & DefaultMapper::EXACT_REGION) != 0);
+        // Second, check if a physical instance exists.
+        if (runtime->find_physical_instance(ctx, target_memory,
+              index_constraints, target_regions, target_instance, true,
+              tight_region_bounds)) {
+          ++num_existing_regions;
+        }
+      }
+      std::cout << "Region index: " << ri << " is instantiated on " <<
+        num_existing_regions << " memory\n";
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+    
   // Allocate regions onto the target processors.
   for (uint32_t ri = 0; ri < task.regions.size(); ++ri) {
     const RegionRequirement& rreq = task.regions[ri];
@@ -638,6 +696,8 @@ void BridgeMapper::set_mapping_from(const MapperContext ctx, const Task& task,
     target_fields[ri] = valid_target_fields;
 
     if (valid_target_fields.empty()) { continue; }
+
+
 
     // Create the new instance with necessary fields and their previleges.
     size_t footprint;
