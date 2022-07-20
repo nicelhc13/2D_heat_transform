@@ -188,7 +188,7 @@ task top_task()
                      plate_right, plate_bottom, times, block_len)
 
     -- Start profiling.
-    BRIDGEMAP.begin_profile()
+    -- BRIDGEMAP.begin_profile()
     -- New timer (TODO(hc): existing timers should be removed)
     var ts_start = regentlib.c.legion_get_current_time_in_micros()
     fm.println("Start computation.")
@@ -207,7 +207,7 @@ task top_task()
       end
     end
     -- End profiling.
-    BRIDGEMAP.end_profile()
+    -- BRIDGEMAP.end_profile()
     fm.println("Computation completes.")
 
     var { init_time, comp_time } = get_elapsed(times)

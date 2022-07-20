@@ -3,7 +3,7 @@ import "regent"
 local c = regentlib.c
 local fm = require("std/format")
 
-local prof_constants = terralib.includec("heat_transfer/profiling/profiling_constants.h")
+local prof_constants = terralib.includec("2D_heat_transform/profiling/profiling_constants.h")
 
 local bridgemap = {}
 

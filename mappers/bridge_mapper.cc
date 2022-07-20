@@ -1,5 +1,5 @@
-#include "heat_transfer/mappers/bridge_mapper.h"
-#include "heat_transfer/profiling/profiling_constants.h"
+#include "2D_heat_transform/mappers/bridge_mapper.h"
+#include "2D_heat_transform/profiling/profiling_constants.h"
 #include "mappers/default_mapper.h"
 
 #include "legion.h"
@@ -73,6 +73,8 @@ private:
   /// Cached mapping.
   std::map<std::pair<TaskID, Processor>,
            std::list<CachedTaskMapping> > cached_task_mappings_;
+	/// Track a mapping between a processor and the number of tasks.
+	std::map<Processor, size_t> num_readytasks_per_proc;
   /// GPU processors.
   /// Logical index will be used.
   /// TODO(hc): is it corresponding to CUDA number?
@@ -105,7 +107,7 @@ BridgeMapper::BridgeMapper(MapperRuntime* rt, Machine machine,
                            Processor local_proc, const char* mapper_name,
                            std::vector<Processor>* procs_list)
   : DefaultMapper(rt, machine, local_proc, mapper_name),
-  num_epochs_(0), default_cpu_processor_(Processor::NO_PROC), debug_(false) {
+  num_epochs_(0), default_cpu_processor_(Processor::NO_PROC), debug_(true) {
   std::set<Processor> all_procs;
   machine.get_all_processors(all_procs);
 
@@ -187,44 +189,58 @@ void BridgeMapper::report_profiling(const MapperContext ctx, const Task& task,
     std::cout << "[Report profiling] Report profiling starts.\n" << std::flush;
   }
   using namespace ProfilingMeasurements;
-  OperationTimeline *tl =
-      input.profiling_responses.get_measurement<OperationTimeline>();
-  int64_t started{-1}, ended{-1};
-  if (tl) {
-    started = tl->start_time;
-    ended = tl->complete_time;
-    delete tl;
-  } else {
-    std::cout << "No operation timeline for task " << task.get_task_name() <<
-      "\n" << std::flush;
-    assert(false);
-  }
 
-  if (is_start_timer_task(task)) {
-    if (debug_) {
-      std::cout << "[Report profiling] Start timer report profiling.\n"
-        << std::flush;
-    }
-    start_time_ = ended;
-    if (debug_) {
-      std::cout << "[Rerport profiling] start timer event is triggered.\n"
-        << std::flush;
-    }
-    // Trigger the timer start event and wake the task up that has been
-    // waiting for the event.
-    runtime->trigger_mapper_event(ctx, defer_mapping_start_);
-  } else if (is_end_timer_task(task)) {
-    end_times_.emplace_back((double)(started - start_time_) / 1000000.0);
-    if (debug_) {
-      std::cout << "[Report profiling] [Iteration:" << num_epochs_ << "] Time "
-        << end_times_.back() << "ms \n" << std::flush;
-      std::cout << "[Report profiling] stop timer event is triggered\n" <<
-        std::flush;
-    }
-    runtime->trigger_mapper_event(ctx, defer_mapping_stop_);
-  }
+	if (is_timer_task(task)) {
+		OperationTimeline *tl =
+				input.profiling_responses.get_measurement<OperationTimeline>();
+		int64_t started{-1}, ended{-1};
+		if (tl) {
+			started = tl->start_time;
+			ended = tl->complete_time;
+			delete tl;
+		} else {
+			std::cout << "No operation timeline for task " << task.get_task_name() <<
+				"\n" << std::flush;
+			assert(false);
+		}
+
+		if (is_start_timer_task(task)) {
+			if (debug_) {
+				std::cout << "[Report profiling] Start timer report profiling.\n"
+					<< std::flush;
+			}
+			start_time_ = ended;
+			if (debug_) {
+				std::cout << "[Rerport profiling] start timer event is triggered.\n"
+					<< std::flush;
+			}
+			// Trigger the timer start event and wake the task up that has been
+			// waiting for the event.
+			runtime->trigger_mapper_event(ctx, defer_mapping_start_);
+		} else if (is_end_timer_task(task)) {
+			end_times_.emplace_back((double)(started - start_time_) / 1000000.0);
+			if (debug_) {
+				std::cout << "[Report profiling] [Iteration:" << num_epochs_ << "] Time "
+					<< end_times_.back() << "ms \n" << std::flush;
+				std::cout << "[Report profiling] stop timer event is triggered\n" <<
+					std::flush;
+			}
+			runtime->trigger_mapper_event(ctx, defer_mapping_stop_);
+		}
+	}
 
   num_epochs_ += 1;
+
+	// Track the number of ready tasks.
+  const Processor& target_proc = task.current_proc;
+	if (num_readytasks_per_proc.find(target_proc) != num_readytasks_per_proc.end()) {
+		num_readytasks_per_proc[target_proc] -= 1;
+	} else {
+		std::cout << "Target processor does not run the specified task.\n" << std::flush;
+		assert(false);
+	}
+	std::cout << "[-] Num of tasks for a processor [" << target_proc << "]:"
+		<< num_readytasks_per_proc[target_proc] << "\n" << std::flush;
 }
 
 void BridgeMapper::map_task(const MapperContext ctx, const Task& task,
@@ -261,9 +277,21 @@ void BridgeMapper::map_task(const MapperContext ctx, const Task& task,
       std::cout << "[Mapping task] Sampled mapping is used. (task name:" <<
         task.get_task_name() << ") \n" << std::flush;
     }
+    using namespace ProfilingMeasurements;
+    output.task_prof_requests.add_measurement<OperationStatus>();
     //generate_mapping_using_coord(ctx, task, input, output);
     set_mapping_from(ctx, task, input, output);
   }
+
+	// Track the number of ready tasks.
+  Processor& target_proc = output.target_procs.back();
+	if (num_readytasks_per_proc.find(target_proc) != num_readytasks_per_proc.end()) {
+		num_readytasks_per_proc[target_proc] += 1;
+	} else {
+		num_readytasks_per_proc[target_proc] = 1;
+	}
+	std::cout << "Num of tasks for a processor [" << target_proc << "]:"
+		<< num_readytasks_per_proc[target_proc] << "\n" << std::flush;
 }
 
 /// It calculates a gpu id by using a domain point.
@@ -648,6 +676,17 @@ void BridgeMapper::set_mapping_from(const MapperContext ctx, const Task& task,
         num_existing_regions << " memory\n";
     }
   }
+
+#if 0
+  using Legion::Internal::ProcessorManager;
+  // Second, access processor manager, and get the number of tasks for each processor.
+  std::map<Processor, ProcessorManager*>& proc_managers =
+                                                runtime->get_proc_managers(ctx);
+  for (std::map<Processor, ProcessorManager*>::const_iterator it =
+        proc_managers.begin(); it != proc_managers.end(); ++it) {
+    it->second->check_task_on_ready_queue(0);
+  }
+#endif
 
   // ---------------------------------------------------------------------------
     
