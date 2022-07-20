@@ -74,7 +74,12 @@ private:
   std::map<std::pair<TaskID, Processor>,
            std::list<CachedTaskMapping> > cached_task_mappings_;
 	/// Track a mapping between a processor and the number of tasks.
-	std::map<Processor, size_t> num_readytasks_per_proc;
+	std::map<Processor, size_t> num_readytasks_per_proc_;
+  /// Track a mapping between a processor and a pair of region tree and
+  /// the number of ready tasks.
+  std::map<Processor, std::map<RegionTreeID, size_t>>
+           num_regiontrees_per_proc_;
+
   /// GPU processors.
   /// Logical index will be used.
   /// TODO(hc): is it corresponding to CUDA number?
@@ -227,20 +232,32 @@ void BridgeMapper::report_profiling(const MapperContext ctx, const Task& task,
 			}
 			runtime->trigger_mapper_event(ctx, defer_mapping_stop_);
 		}
-	}
+	} else {
+    // Track the number of ready tasks.
+    const Processor& target_proc = task.current_proc;
+    if (num_readytasks_per_proc_.find(target_proc) != num_readytasks_per_proc_.end()) {
+      num_readytasks_per_proc_[target_proc] -= 1;
+    } else {
+      std::cout << "Target processor does not run the specified task.\n" << std::flush;
+      assert(false);
+    }
+    std::cout << "[-] Num of tasks for a processor [" << target_proc << "]:"
+      << num_readytasks_per_proc_[target_proc] << "\n" << std::flush;
+
+    // Update the number of region-task mapping.
+    for (uint32_t ri = 0; ri < task.regions.size(); ++ri) {
+      LogicalRegion logical_region = task.regions[ri].region;
+      RegionTreeID tree_id = logical_region.get_tree_id();
+      num_regiontrees_per_proc_[target_proc][tree_id] -= 1;
+      std::cout << "Decreased " << tree_id << "\n";
+      if (num_regiontrees_per_proc_[target_proc][tree_id] < 0) {
+        std::cout << "A region of a task was not tracked.\n" << std::flush;
+        assert(false);
+      }
+    }
+  }
 
   num_epochs_ += 1;
-
-	// Track the number of ready tasks.
-  const Processor& target_proc = task.current_proc;
-	if (num_readytasks_per_proc.find(target_proc) != num_readytasks_per_proc.end()) {
-		num_readytasks_per_proc[target_proc] -= 1;
-	} else {
-		std::cout << "Target processor does not run the specified task.\n" << std::flush;
-		assert(false);
-	}
-	std::cout << "[-] Num of tasks for a processor [" << target_proc << "]:"
-		<< num_readytasks_per_proc[target_proc] << "\n" << std::flush;
 }
 
 void BridgeMapper::map_task(const MapperContext ctx, const Task& task,
@@ -285,13 +302,13 @@ void BridgeMapper::map_task(const MapperContext ctx, const Task& task,
 
 	// Track the number of ready tasks.
   Processor& target_proc = output.target_procs.back();
-	if (num_readytasks_per_proc.find(target_proc) != num_readytasks_per_proc.end()) {
-		num_readytasks_per_proc[target_proc] += 1;
+	if (num_readytasks_per_proc_.find(target_proc) != num_readytasks_per_proc_.end()) {
+		num_readytasks_per_proc_[target_proc] += 1;
 	} else {
-		num_readytasks_per_proc[target_proc] = 1;
+		num_readytasks_per_proc_[target_proc] = 1;
 	}
 	std::cout << "Num of tasks for a processor [" << target_proc << "]:"
-		<< num_readytasks_per_proc[target_proc] << "\n" << std::flush;
+		<< num_readytasks_per_proc_[target_proc] << "\n" << std::flush;
 }
 
 /// It calculates a gpu id by using a domain point.
@@ -624,6 +641,13 @@ void BridgeMapper::set_mapping_from(const MapperContext ctx, const Task& task,
 
   // --- Test code getting the number of existing physical instances -----------
 
+  // Check if a processor is materialized on the proc. to region tree mapping.
+  if (num_regiontrees_per_proc_.find(target_proc) ==
+      num_regiontrees_per_proc_.end()) {
+    num_regiontrees_per_proc_[target_proc] = {};
+  }
+
+  size_t accum_tasks_using_common_regions{0};
   // First, get the number of existing physical instances as a test.
   for (uint32_t ri = 0; ri < task.regions.size(); ++ri) {
     const TaskLayoutConstraintSet &task_layout_constraints =
@@ -675,7 +699,27 @@ void BridgeMapper::set_mapping_from(const MapperContext ctx, const Task& task,
       std::cout << "Region index: " << ri << " is instantiated on " <<
         num_existing_regions << " memory\n";
     }
+
+    // Get the logical region.
+    LogicalRegion logical_region = task.regions[ri].region;
+    // Get the logical region tree id.
+    RegionTreeID tree_id = logical_region.get_tree_id(); 
+
+
+    std::map<RegionTreeID, size_t>::iterator found;
+    if ((found = num_regiontrees_per_proc_[target_proc].find(tree_id)) !=
+          num_regiontrees_per_proc_[target_proc].end()) {
+      std::cout << "Found.:" << found->second << "," << tree_id << "\n";
+      accum_tasks_using_common_regions += found->second;
+      found->second += 1;
+    } else {
+      std::cout << "Not found:" << tree_id << "\n";
+      num_regiontrees_per_proc_[target_proc][tree_id] = 1;
+    }
   }
+
+  std::cout << "Task:" << task.get_task_name() << "'s regions are materialized "
+    << " by " << accum_tasks_using_common_regions << " ready tasks.\n";
 
 #if 0
   using Legion::Internal::ProcessorManager;
@@ -735,8 +779,6 @@ void BridgeMapper::set_mapping_from(const MapperContext ctx, const Task& task,
     target_fields[ri] = valid_target_fields;
 
     if (valid_target_fields.empty()) { continue; }
-
-
 
     // Create the new instance with necessary fields and their previleges.
     size_t footprint;
